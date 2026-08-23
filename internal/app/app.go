@@ -101,6 +101,10 @@ func (a *App) MoveCrane(ctx context.Context, craneID model.CraneID, from, to mod
 	if err := a.guard.AcquireHoistLease(craneID); err != nil {
 		return err
 	}
+	// A rejected path (plan/interlock/motion failure) must release the
+	// hoist-axis interlock lease so the crane is not left reporting
+	// "hoist resource occupied" for every subsequent task.
+	defer a.guard.ReleaseHoistLease(craneID)
 	svc, ok := a.coord.Get(craneID)
 	if !ok {
 		return model.ErrCraneNotFound
