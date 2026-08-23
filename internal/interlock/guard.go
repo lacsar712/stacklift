@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/lacsar712/stacklift/internal/clock"
 	"github.com/lacsar712/stacklift/internal/model"
@@ -12,14 +11,13 @@ import (
 
 type Guard struct {
 	limits model.LimitSet
-	clk    *clock.DualClock
-	dwells map[model.CraneID]clock.DwellWindow
+	clk     *clock.DualClock
+	dwells  map[model.CraneID]clock.DwellWindow
 	hoistLease map[model.CraneID]bool
-	wallDwellStart map[model.CraneID]time.Time
 }
 
 func NewGuard(limits model.LimitSet, clk *clock.DualClock) *Guard {
-	return &Guard{limits: limits, clk: clk, dwells: make(map[model.CraneID]clock.DwellWindow), hoistLease: make(map[model.CraneID]bool), wallDwellStart: make(map[model.CraneID]time.Time)}
+	return &Guard{limits: limits, clk: clk, dwells: make(map[model.CraneID]clock.DwellWindow), hoistLease: make(map[model.CraneID]bool)}
 }
 
 func (g *Guard) AcquireHoistLease(crane model.CraneID) error {
@@ -91,21 +89,19 @@ func (g *Guard) CheckAxis(status model.CraneStatus, axis model.MotionAxis) error
 
 func (g *Guard) StartDwell(crane model.CraneID) {
 	g.dwells[crane] = clock.NewDwellWindow(g.clk.ProcessTick(), g.limits.DwellWindowTicks)
-	g.wallDwellStart[crane] = g.clk.WallNow()
 }
 
+// DwellComplete judges effective dwell against the motion process clock, which
+// only advances while the motion loop is running. This keeps confirmation
+// consistent with the process-clock accumulation used elsewhere and prevents
+// wall-clock drift (e.g. communication/latency compensation) from closing the
+// window early before the minimum dwell has been reached.
 func (g *Guard) DwellComplete(crane model.CraneID) bool {
 	w, ok := g.dwells[crane]
 	if !ok {
 		return true
 	}
-	start, ok := g.wallDwellStart[crane]
-	if !ok {
-		return false
-	}
-	elapsed := g.clk.Wall.Since(start)
-	required := time.Duration(w.RequiredTicks) * time.Millisecond
-	return elapsed >= required
+	return g.clk.DwellSatisfied(w)
 }
 
 func (g *Guard) DwellRemaining(crane model.CraneID) int64 {
