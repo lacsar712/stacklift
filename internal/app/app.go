@@ -112,7 +112,7 @@ func (a *App) MoveCrane(ctx context.Context, craneID model.CraneID, from, to mod
 		return err
 	}
 	if err := a.estop.Monitor().CheckTravelSpeed(craneID, a.planner.PeakTravelSpeed(plan)); err != nil {
-		return fmt.Errorf("motion: %v", err)
+		return fmt.Errorf("motion: %w", err)
 	}
 	for _, step := range plan.Steps {
 		if err := a.guard.ValidateMotion(ctx, status, step.Axis); err != nil {
