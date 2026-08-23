@@ -11,9 +11,14 @@ import (
 	"github.com/lacsar712/stacklift/internal/model"
 )
 
+// WrapMotionFault rewrites a low-level motion fault into a maintenance-facing
+// fault label while preserving the original sentinel so that downstream
+// recovery classification (e.g. errors.Is(model.ErrEncoderSlip)) can still
+// discriminate a recoverable encoder fault from one that needs a full
+// machine reset. Use %w so the wrapped cause stays in the error chain.
 func WrapMotionFault(err error) error {
 	if errors.Is(err, model.ErrEncoderSlip) {
-		return fmt.Errorf("encoder fault")
+		return fmt.Errorf("encoder fault: %w", model.ErrEncoderSlip)
 	}
 	return err
 }
