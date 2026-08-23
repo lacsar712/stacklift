@@ -77,7 +77,7 @@ func (a *App) RetrievePallet(ctx context.Context, craneID model.CraneID, pallet 
 		return err
 	}
 	depthMM := int64(source.Depth+1) * a.Config().Warehouse.BayPitchMM
-	if err := svc.ForkHandler().Pickup(context.Background(), depthMM); err != nil {
+	if err := svc.ForkHandler().Pickup(ctx, depthMM); err != nil {
 		return err
 	}
 	if err := svc.LoadPallet(pallet); err != nil {
