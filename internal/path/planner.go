@@ -26,7 +26,12 @@ func (p *Planner) ExportPendingSteps(crane model.CraneID) []model.MotionStep {
 	if !ok {
 		return nil
 	}
-	return plan.Steps
+	// Return an independent copy so callers (e.g. obstacle-avoidance) can adjust
+	// intermediate waypoints without mutating the on-board pending plan that the
+	// crane subsequently executes.
+	out := make([]model.MotionStep, len(plan.Steps))
+	copy(out, plan.Steps)
+	return out
 }
 
 func (p *Planner) PeakTravelSpeed(plan model.MotionPlan) float64 {
