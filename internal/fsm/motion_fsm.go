@@ -90,14 +90,8 @@ func (m *MotionMachine) Fire(ctx context.Context, crane model.CraneID, event mod
 	from := m.ensureLocked(crane)
 	to, ok := TargetPhase(from, event)
 	if !ok {
-		if from == model.PhaseIdle && event == model.EventLoadPallet {
-			effects := append([]TransitionEffect{}, m.effects...)
-			m.mu.Unlock()
-			for _, fx := range effects {
-				_ = fx(ctx, crane, from, model.PhaseForking)
-			}
-			return model.TransitionResult{false, from, "illegal", m.revision[crane]}, model.NewPhaseError(from, from, model.ErrInvalidPhase)
-		}
+		// Illegal transition: must not mutate phase, fire effects, or
+		// otherwise alter travel enable / hoist permission state.
 		rev := m.revision[crane]
 		m.mu.Unlock()
 		return model.TransitionResult{false, from, "illegal", rev}, model.NewPhaseError(from, from, model.ErrInvalidPhase)
