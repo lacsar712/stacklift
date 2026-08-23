@@ -15,7 +15,7 @@ type ProcessClock struct {
 	listeners []func(int64)
 }
 
-func New(stepMS int64) *ProcessClock {
+func NewProcess(stepMS int64) *ProcessClock {
 	if stepMS <= 0 {
 		stepMS = 100
 	}
@@ -23,6 +23,12 @@ func New(stepMS int64) *ProcessClock {
 }
 
 func (c *ProcessClock) Tick() int64 { return atomic.LoadInt64(&c.tick) }
+
+func (c *ProcessClock) StepMS() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stepMS
+}
 
 func (c *ProcessClock) Advance(n int64) int64 {
 	if n <= 0 {
@@ -53,6 +59,12 @@ func (c *ProcessClock) Pause() {
 	c.mu.Unlock()
 }
 
+func (c *ProcessClock) Resume() {
+	c.mu.Lock()
+	c.paused = false
+	c.mu.Unlock()
+}
+
 func (c *ProcessClock) Paused() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -72,4 +84,25 @@ func (c *ProcessClock) WindowClosed(startTick, windowTicks int64) bool {
 		return true
 	}
 	return c.ElapsedTicks(startTick) >= windowTicks
+}
+
+func (c *ProcessClock) OnTick(fn func(int64)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.listeners = append(c.listeners, fn)
+}
+
+func (c *ProcessClock) StartedAt() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.started
+}
+
+func (c *ProcessClock) Reset() {
+	c.mu.Lock()
+	c.tick = 0
+	c.paused = false
+	c.started = time.Now()
+	c.mu.Unlock()
+	atomic.StoreInt64(&c.tick, 0)
 }

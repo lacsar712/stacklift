@@ -1,68 +1,160 @@
-// Package model defines shared crane rig domain types.
+// Package model defines ASRS stacker crane domain types.
 package model
 
-import "time"
-
-type DutyMode string
-
-const (
-	DutyIdle      DutyMode = "idle"
-	DutyHoist     DutyMode = "hoist"
-	DutySlew      DutyMode = "slew"
-	DutyLuff      DutyMode = "luff"
-	DutyEmergency DutyMode = "emergency"
-	DutyWindHold  DutyMode = "wind_hold"
-	DutyFault     DutyMode = "fault"
+import (
+	"fmt"
+	"time"
 )
 
-type RigPose struct {
-	RigID        string
-	AzimuthDeg   float64
-	RadiusM      float64
-	HookHeightM  float64
-	BoomAngleDeg float64
-	MomentPct    float64
-	ProcessTick  int64
-	UpdatedAt    time.Time
+type CraneID string
+type AisleID string
+type BayID string
+type PalletID string
+type TaskID string
+
+type MotionAxis string
+
+const (
+	AxisTravel MotionAxis = "travel"
+	AxisHoist  MotionAxis = "hoist"
+	AxisFork   MotionAxis = "fork"
+)
+
+type CranePhase string
+
+const (
+	PhaseIdle      CranePhase = "idle"
+	PhaseTraveling CranePhase = "traveling"
+	PhaseHoisting  CranePhase = "hoisting"
+	PhaseForking   CranePhase = "forking"
+	PhaseLoading   CranePhase = "loading"
+	PhaseUnloading CranePhase = "unloading"
+	PhaseDwell     CranePhase = "dwell"
+	PhaseEmergency CranePhase = "emergency"
+	PhaseFault     CranePhase = "fault"
+)
+
+type ForkPosition string
+
+const (
+	ForkRetracted ForkPosition = "retracted"
+	ForkExtended  ForkPosition = "extended"
+	ForkCentered  ForkPosition = "centered"
+)
+
+type Location struct {
+	Aisle AisleID
+	Bay   int
+	Level int
+	Depth int
 }
 
-func (p RigPose) Clone() RigPose { return p }
+func (l Location) String() string {
+	return fmt.Sprintf("A%s B%d L%d D%d", l.Aisle, l.Bay, l.Level, l.Depth)
+}
 
-type LoadSample struct {
-	RigID       string
-	MassKg      float64
-	MomentPct   float64
-	Stale       bool
+func (l Location) Valid() bool {
+	return l.Aisle != "" && l.Bay > 0 && l.Level > 0 && l.Depth >= 0
+}
+
+func (l Location) Equal(other Location) bool {
+	return l.Aisle == other.Aisle && l.Bay == other.Bay &&
+		l.Level == other.Level && l.Depth == other.Depth
+}
+
+type CranePose struct {
+	CraneID     CraneID
+	Location    Location
+	TravelMM    int64
+	HoistMM     int64
+	ForkMM      int64
+	ForkPos     ForkPosition
+	Loaded      bool
+	PalletID    PalletID
 	ProcessTick int64
-	At          time.Time
+	UpdatedAt   time.Time
 }
 
-func (s LoadSample) Clone() LoadSample { return s }
+func (p CranePose) Clone() CranePose { return p }
 
-type WindSample struct {
-	RigID        string
-	SpeedMS      float64
-	GustMS       float64
-	DirectionDeg float64
-	ProcessTick  int64
-	At           time.Time
+type MotionCommand struct {
+	TaskID   TaskID
+	CraneID  CraneID
+	Axis     MotionAxis
+	TargetMM int64
+	SpeedMMS float64
 }
 
-func (s WindSample) Clone() WindSample { return s }
+type MotionProgress struct {
+	Axis        MotionAxis
+	StartMM     int64
+	CurrentMM   int64
+	TargetMM    int64
+	StartedTick int64
+	Complete    bool
+}
+
+func (m MotionProgress) RemainingMM() int64 {
+	diff := m.TargetMM - m.CurrentMM
+	if diff < 0 {
+		return -diff
+	}
+	return diff
+}
+
+type StorageCell struct {
+	Location   Location
+	PalletID   PalletID
+	Occupied   bool
+	Reserved   bool
+	ReservedBy CraneID
+}
+
+func (c StorageCell) Clone() StorageCell { return c }
+
+type CraneStatus struct {
+	CraneID     CraneID
+	Phase       CranePhase
+	Pose        CranePose
+	Travel      MotionProgress
+	Hoist       MotionProgress
+	Fork        MotionProgress
+	Interlocked bool
+	EStopActive bool
+	ActiveTask  TaskID
+	Revision    uint64
+	UpdatedAt   time.Time
+}
+
+func (s CraneStatus) Clone() CraneStatus {
+	s.Pose = s.Pose.Clone()
+	return s
+}
 
 type TransitionRequest struct {
-	RigID string
-	From  DutyMode
-	To    DutyMode
-	Tick  int64
-	Force bool
+	CraneID CraneID
+	From    CranePhase
+	To      CranePhase
+	Tick    int64
+	Force   bool
 }
 
 type TransitionResult struct {
 	Accepted bool
-	Mode     DutyMode
+	Phase    CranePhase
 	Reason   string
 	Revision uint64
+}
+
+type RetrievalTask struct {
+	ID         TaskID
+	CraneID    CraneID
+	PalletID   PalletID
+	Source     Location
+	Dest       Location
+	CreatedAt  time.Time
+	StartedAt  *time.Time
+	FinishedAt *time.Time
 }
 
 type AlarmLevel int
@@ -74,7 +166,7 @@ const (
 )
 
 type Alarm struct {
-	RigID   string
+	CraneID CraneID
 	Code    string
 	Level   AlarmLevel
 	Message string
@@ -83,49 +175,40 @@ type Alarm struct {
 
 func (a Alarm) Clone() Alarm { return a }
 
-type RigStatus struct {
-	RigID       string
-	Mode        DutyMode
-	Pose        RigPose
-	Load        LoadSample
-	Wind        WindSample
-	MomentPct   float64
-	WindHold    bool
-	Interlocked bool
-	Revision    uint64
-}
-
-func (s RigStatus) Clone() RigStatus {
-	s.Pose = s.Pose.Clone()
-	s.Load = s.Load.Clone()
-	s.Wind = s.Wind.Clone()
-	return s
-}
-
 type LimitSet struct {
-	MaxMomentPct, WarnMomentPct, MaxWindMS, GustFactor float64
-	MaxRadiusM, MinRadiusM, MaxBoomAngleDeg, MinBoomAngleDeg float64
+	MaxTravelMM      int64
+	MaxHoistMM       int64
+	MaxForkMM        int64
+	MaxTravelSpeed   float64
+	MaxHoistSpeed    float64
+	MaxForkSpeed     float64
+	MinHoistClearMM  int64
+	DwellWindowTicks int64
 }
 
 func DefaultLimits() LimitSet {
-	return LimitSet{100, 85, 13.8, 1.35, 60, 5, 75, 15}
+	return LimitSet{
+		MaxTravelMM: 120000, MaxHoistMM: 18000, MaxForkMM: 2500,
+		MaxTravelSpeed: 2000, MaxHoistSpeed: 800, MaxForkSpeed: 400,
+		MinHoistClearMM: 500, DwellWindowTicks: 5,
+	}
 }
 
 func (l LimitSet) Validate() error {
-	if l.MaxMomentPct <= 0 {
-		return errLimits("max_moment_pct")
+	if l.MaxTravelMM <= 0 {
+		return errLimits("max_travel_mm")
 	}
-	if l.WarnMomentPct <= 0 || l.WarnMomentPct > l.MaxMomentPct {
-		return errLimits("warn_moment_pct")
+	if l.MaxHoistMM <= 0 {
+		return errLimits("max_hoist_mm")
 	}
-	if l.MaxWindMS <= 0 {
-		return errLimits("max_wind_ms")
+	if l.MaxForkMM <= 0 {
+		return errLimits("max_fork_mm")
 	}
-	if l.GustFactor < 1 {
-		return errLimits("gust_factor")
+	if l.MaxTravelSpeed <= 0 || l.MaxHoistSpeed <= 0 || l.MaxForkSpeed <= 0 {
+		return errLimits("speed")
 	}
-	if l.MaxRadiusM <= l.MinRadiusM {
-		return errLimits("radius")
+	if l.DwellWindowTicks < 0 {
+		return errLimits("dwell_window_ticks")
 	}
 	return nil
 }
@@ -133,13 +216,22 @@ func (l LimitSet) Validate() error {
 type limitsError string
 
 func (e limitsError) Error() string { return "model limits: " + string(e) }
-func errLimits(msg string) error    { return limitsError(msg) }
+func errLimits(field string) error  { return limitsError(field) }
 
-func DeepCopyPose(items []RigPose) []RigPose {
+func DeepCopyPoses(items []CranePose) []CranePose {
 	if len(items) == 0 {
 		return nil
 	}
-	out := make([]RigPose, len(items))
+	out := make([]CranePose, len(items))
+	copy(out, items)
+	return out
+}
+
+func DeepCopyCells(items []StorageCell) []StorageCell {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]StorageCell, len(items))
 	copy(out, items)
 	return out
 }

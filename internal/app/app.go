@@ -1,200 +1,134 @@
-// Package app wires stacklift subsystems into a runnable site service.
 package app
 
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"sync"
-	"time"
 
-	"github.com/lacsar712/stacklift/internal/alarm"
-	"github.com/lacsar712/stacklift/internal/api"
-	"github.com/lacsar712/stacklift/internal/boom"
+	"github.com/lacsar712/stacklift/internal/aisle"
 	"github.com/lacsar712/stacklift/internal/clock"
 	"github.com/lacsar712/stacklift/internal/config"
-	"github.com/lacsar712/stacklift/internal/counter"
 	"github.com/lacsar712/stacklift/internal/crane"
 	"github.com/lacsar712/stacklift/internal/fsm"
-	"github.com/lacsar712/stacklift/internal/hook"
 	"github.com/lacsar712/stacklift/internal/interlock"
-	"github.com/lacsar712/stacklift/internal/journal"
-	"github.com/lacsar712/stacklift/internal/load"
 	"github.com/lacsar712/stacklift/internal/model"
-	"github.com/lacsar712/stacklift/internal/slew"
+	"github.com/lacsar712/stacklift/internal/path"
+	"github.com/lacsar712/stacklift/internal/safety"
 	"github.com/lacsar712/stacklift/internal/store"
-	"github.com/lacsar712/stacklift/internal/telemetry"
-	"github.com/lacsar712/stacklift/internal/wind"
 )
 
-type Service struct {
-	Cfg         config.Config
-	Clock       *clock.ProcessClock
-	Store       *store.RigStore
-	Group       *crane.Group
-	CraneSvc    *crane.Service
-	Coordinator *slew.Coordinator
-	FSM         *fsm.DutyMachine
-	Emitter     *slew.Emitter
-	Plant       *slew.Plant
-	BoomDriver  *boom.Driver
-	Interlock   *interlock.Guard
-	WindWindow  *interlock.WindWindow
-	LoadSensor  *load.Sensor
-	Checker     *load.Checker
-	Anemo       map[string]*wind.Anemometer
-	HookSensor  map[string]*hook.Sensor
-	Counter     *counter.CycleCounter
-	Alarms      *alarm.Bus
-	Telemetry   *telemetry.Bus
-	Journal     *journal.Writer
-	Server      *api.Server
-	HTTP        *http.Server
-	rootCtx     context.Context
-	cancel      context.CancelFunc
-	mu          sync.Mutex
-	started     bool
+type App struct {
+	mu        sync.RWMutex
+	cfg       config.Config
+	clk       *clock.DualClock
+	coord     *crane.Coordinator
+	rig       *store.Rig
+	fsm       *fsm.MotionMachine
+	guard     *interlock.Guard
+	estop     *safety.EStopController
+	registry  *aisle.Registry
+	occupancy *aisle.Occupancy
+	planner   *path.Planner
+	started   bool
 }
 
-func New(cfg config.Config) (*Service, error) {
-	cfg = config.FromEnv(cfg)
+func New(cfg config.Config) (*App, error) {
 	if err := cfg.Validate(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("app init: %w", err)
 	}
-	root, cancel := context.WithCancel(context.Background())
-	clk := clock.New(cfg.ProcessTickMS)
-	st := store.NewRigStore()
-	emitter := slew.NewEmitter()
-	plant := slew.NewPlant(emitter, 5)
-	limits := interlock.LimitsFromConfig(cfg)
-	windWindow := interlock.NewWindWindow(limits, clk)
-	guard := interlock.NewGuard(limits, windWindow)
-	loadSensor := load.NewSensor()
-	checker := load.NewChecker(loadSensor, cfg.Limits)
-	geom := boom.NewGeometry(cfg.Limits.MinRadiusM, cfg.Limits.MaxRadiusM, cfg.Limits.MinBoomAngleDeg, cfg.Limits.MaxBoomAngleDeg)
-	boomDriver := boom.NewDriver(geom, 40, 5)
-	coord := slew.NewCoordinator(plant, boomDriver, guard, checker, 5)
-	machine := fsm.NewDutyMachine(emitter)
-	group := crane.NewGroup()
-	builder := crane.NewBuilder(40, 12000, 5, cfg.Limits, cfg.WindHoldWindow)
-	anemoMap := make(map[string]*wind.Anemometer)
-	hookMap := make(map[string]*hook.Sensor)
-	for _, id := range cfg.RigIDs {
-		rig := builder.Build(id, emitter, machine, st)
-		group.Register(rig)
-		anemoMap[id] = rig.Anemo
-		hookMap[id] = rig.Hook
-		guard.SetMode(id, model.DutyIdle)
-	}
-	craneSvc := crane.NewService(group, coord, loadSensor, machine, st)
-	alarms := alarm.NewBus(30 * time.Second)
-	telem := telemetry.NewBus(cfg.TelemetryBuffer)
-	journalW := journal.NewWriter(cfg.JournalPath, 2000)
-	s := &Service{
-		Cfg: cfg, Clock: clk, Store: st, Group: group, CraneSvc: craneSvc,
-		Coordinator: coord, FSM: machine, Emitter: emitter, Plant: plant, BoomDriver: boomDriver,
-		Interlock: guard, WindWindow: windWindow, LoadSensor: loadSensor, Checker: checker,
-		Anemo: anemoMap, HookSensor: hookMap, Counter: counter.New(500),
-		Alarms: alarms, Telemetry: telem, Journal: journalW, rootCtx: root, cancel: cancel,
-	}
-	s.Server = api.New(cfg, s, group, st, guard, alarms, telem, journalW, clk)
-	craneSvc.Bootstrap()
-	return s, nil
+	clk := clock.NewDual(cfg.ClockStep)
+	layout := config.NewLayout(cfg.Warehouse)
+	planner := path.NewPlanner(layout, cfg.Limits)
+	coord := crane.NewCoordinator(planner, clk, cfg.Limits)
+	occupancy := aisle.NewOccupancy(layout.AllCells())
+	monitor := safety.NewMonitor(cfg.Limits)
+	rig := store.NewRig(coord, occupancy, monitor, clk)
+	guard := interlock.NewGuard(cfg.Limits, clk)
+	estop := safety.NewEStopController(coord, monitor)
+	machine := fsm.NewMotionMachine()
+	fsm.RegisterDefaultEffects(machine, coord, clk, cfg.Limits)
+	return &App{
+		cfg: cfg, clk: clk, coord: coord, rig: rig, fsm: machine,
+		guard: guard, estop: estop, registry: aisle.NewRegistry(),
+		occupancy: occupancy, planner: planner,
+	}, nil
 }
 
-func (s *Service) RequestSlew(ctx context.Context, rigID string, targetAz, targetRadius float64, reason string) error {
-	if !s.Cfg.RigKnown(rigID) {
-		return fmt.Errorf("app: unknown rig %s", rigID)
+func (a *App) Start(ctx context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.started {
+		return nil
 	}
-	if err := s.CraneSvc.RequestSlew(ctx, rigID, targetAz, targetRadius, reason); err != nil {
-		return err
+	layout := config.NewLayout(a.cfg.Warehouse)
+	for i := 1; i <= a.cfg.Warehouse.Aisles; i++ {
+		aisleID := model.AisleID(fmt.Sprintf("%02d", i))
+		craneID := model.CraneID(fmt.Sprintf("CR-%02d", i))
+		svc := a.coord.Register(craneID)
+		home := layout.CraneHome(aisleID)
+		pos := layout.LocationToPosition(home)
+		svc.SetPose(model.CranePose{
+			CraneID: craneID, Location: home,
+			TravelMM: pos.TravelMM, HoistMM: pos.HoistMM, ForkMM: pos.ForkMM,
+			ForkPos: model.ForkRetracted,
+		})
+		a.fsm.Ensure(craneID)
+		_ = a.registry.Register(aisle.AisleInfo{
+			ID: aisleID, CraneID: craneID,
+			LengthMM: int64(a.cfg.Warehouse.BaysPerAisle) * a.cfg.Warehouse.BayPitchMM, Active: true,
+		})
 	}
-	tick := s.Clock.Tick()
-	s.Telemetry.Emit("app", "slew", rigID, tick, reason)
-	s.Journal.Append(tick, rigID, "slew", reason)
+	a.started = true
+	a.rig.Capture()
 	return nil
 }
 
-func (s *Service) Transition(ctx context.Context, rigID string, to model.DutyMode) (model.TransitionResult, error) {
-	from := s.FSM.ModeOf(rigID)
-	res, err := s.FSM.Transition(ctx, model.TransitionRequest{RigID: rigID, From: from, To: to, Tick: s.Clock.Tick()})
-	if res.Accepted {
-		s.Interlock.SetMode(rigID, to)
-		s.Journal.Append(s.Clock.Tick(), rigID, "transition", string(to))
-	}
-	return res, err
-}
+func (a *App) Config() config.Config              { return a.cfg }
+func (a *App) Clock() *clock.DualClock           { return a.clk }
+func (a *App) Coordinator() *crane.Coordinator   { return a.coord }
+func (a *App) Rig() *store.Rig                   { return a.rig }
+func (a *App) FSM() *fsm.MotionMachine           { return a.fsm }
+func (a *App) Guard() *interlock.Guard           { return a.guard }
+func (a *App) EStop() *safety.EStopController    { return a.estop }
+func (a *App) Occupancy() *aisle.Occupancy       { return a.occupancy }
+func (a *App) Registry() *aisle.Registry           { return a.registry }
+func (a *App) Planner() *path.Planner            { return a.planner }
 
-func (s *Service) EmergencyStop(rigID string) error {
-	tick := s.Clock.Tick()
-	if err := s.CraneSvc.EmergencyStop(rigID, tick); err != nil {
-		return err
-	}
-	s.Interlock.SetMode(rigID, model.DutyEmergency)
-	s.Alarms.RaiseEmergency(rigID)
-	s.Telemetry.Emit("app", "emergency", rigID, tick, "stop")
-	return nil
-}
+func (a *App) Snapshot() model.WarehouseSnapshot { return a.rig.Capture() }
 
-func (s *Service) IngestWind(sample model.WindSample) error {
-	anemo, ok := s.Anemo[sample.RigID]
+func (a *App) MoveCrane(ctx context.Context, craneID model.CraneID, from, to model.Location) error {
+	svc, ok := a.coord.Get(craneID)
 	if !ok {
-		return fmt.Errorf("app: unknown rig %s", sample.RigID)
+		return model.ErrCraneNotFound
 	}
-	err := anemo.Ingest(sample)
-	s.Interlock.SetWindFault(sample.RigID, err)
+	status := svc.Status()
+	plan, err := a.planner.Plan("", craneID, from, to)
 	if err != nil {
-		s.Alarms.RaiseWind(sample.RigID, wind.Classify(err), sample.SpeedMS)
-		if wind.IsBan(err) {
-			_, _ = s.Transition(s.rootCtx, sample.RigID, model.DutyWindHold)
+		return err
+	}
+	for _, step := range plan.Steps {
+		if err := a.guard.ValidateMotion(ctx, status, step.Axis); err != nil {
+			return err
 		}
 	}
-	return err
-}
-
-func (s *Service) IngestLoad(sample model.LoadSample) {
-	s.LoadSensor.Put(sample)
-	s.CraneSvc.IngestLoad(sample)
-	if sample.MomentPct > s.Cfg.Limits.MaxMomentPct {
-		s.Interlock.SetLoadFault(sample.RigID, load.Wrap(sample.RigID, load.ErrMomentExceeded))
-		s.Alarms.RaiseMoment(sample.RigID, sample.MomentPct)
-	} else if sample.Stale {
-		s.Interlock.SetLoadFault(sample.RigID, load.Wrap(sample.RigID, load.ErrStaleLoad))
-		s.Alarms.RaiseStaleLoad(sample.RigID)
-	} else {
-		s.Interlock.SetLoadFault(sample.RigID, nil)
+	if err := a.coord.MoveCrane(ctx, craneID, from, to); err != nil {
+		return err
 	}
+	a.rig.RefreshCrane(craneID)
+	return nil
 }
 
-func (s *Service) TickOnce() {
-	tick := s.Clock.AdvanceOne()
-	s.Alarms.Tick(time.Now())
-	for _, id := range s.Cfg.RigIDs {
-		if hookS, ok := s.HookSensor[id]; ok {
-			if p, ok := hookS.Last(id); ok {
-				sample, _ := hookS.ToLoadSample(id, false)
-				sample.MomentPct = p.MomentPct
-				s.IngestLoad(sample)
-			}
-		}
-		if anemo, ok := s.Anemo[id]; ok {
-			if w, ok := anemo.Last(id); ok {
-				_ = s.IngestWind(w)
-			}
-		}
-		st := model.RigStatus{RigID: id, Mode: s.FSM.ModeOf(id)}
-		if pose, ok := s.Store.GetPose(id); ok {
-			st.Pose = pose
-			st.MomentPct = pose.MomentPct
-		}
-		if sample, ok := s.LoadSensor.Get(id); ok {
-			st.Load = sample
-		}
-		st.WindHold = s.WindWindow.Active(id)
-		st.Interlocked = len(s.Interlock.Eval(id, interlock.MotionSlew)) > 0
-		s.Store.PutStatus(st)
-	}
-	_ = tick
+func (a *App) Shutdown(ctx context.Context) {
+	a.coord.CancelAll()
+	a.started = false
 }
 
-func (s *Service) Cancel() { s.cancel() }
+func (a *App) Started() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.started
+}
+
+func (a *App) CraneCount() int { return a.coord.Count() }
+
+func (a *App) AdvanceClock(n int64) int64 { return a.clk.Process.Advance(n) }

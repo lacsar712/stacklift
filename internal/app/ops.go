@@ -2,48 +2,91 @@ package app
 
 import (
 	"context"
-	"errors"
+	"fmt"
 
-	"github.com/lacsar712/stacklift/internal/counter"
-	"github.com/lacsar712/stacklift/internal/load"
+	"github.com/lacsar712/stacklift/internal/config"
+	"github.com/lacsar712/stacklift/internal/fsm"
 	"github.com/lacsar712/stacklift/internal/model"
-	"github.com/lacsar712/stacklift/internal/wind"
 )
 
-func (s *Service) HandleFault(rigID string, err error) string {
-	if err == nil {
-		return "ok"
+func RunDemo(ctx context.Context, a *App) error {
+	if err := a.Start(ctx); err != nil {
+		return err
 	}
-	switch {
-	case errors.Is(err, load.ErrMomentExceeded):
-		return "moment"
-	case errors.Is(err, load.ErrStaleLoad):
-		return "stale_load"
-	case errors.Is(err, wind.ErrWindGust):
-		return "wind_gust"
-	case errors.Is(err, wind.ErrSustainedHigh):
-		return "wind_ban"
-	case errors.Is(err, counter.ErrCycleLimit):
-		return "cycle_limit"
-	default:
-		return "unknown"
+	cranes := a.Coordinator().CraneIDs()
+	if len(cranes) == 0 {
+		return fmt.Errorf("no cranes registered")
 	}
+	craneID := cranes[0]
+	aisleID, ok := a.Registry().AisleForCrane(craneID)
+	if !ok {
+		aisleID = model.AisleID("01")
+	}
+	home := model.Location{Aisle: aisleID, Bay: 1, Level: 1, Depth: 0}
+	target := model.Location{Aisle: aisleID, Bay: 3, Level: 2, Depth: 1}
+	if err := a.Occupancy().Place(target, model.PalletID("PLT-001")); err != nil {
+		return err
+	}
+	machine := a.FSM()
+	ctx = fsm.WithDwellMachine(ctx, machine)
+	if _, err := machine.Fire(ctx, craneID, model.EventStartTravel); err != nil {
+		return err
+	}
+	if _, err := machine.Fire(ctx, craneID, model.EventTravelDone); err != nil {
+		return err
+	}
+	if err := a.MoveCrane(ctx, craneID, home, target); err != nil {
+		return err
+	}
+	a.AdvanceClock(a.Config().Limits.DwellWindowTicks)
+	if _, err := machine.Fire(ctx, craneID, model.EventDwellStart); err == nil {
+		a.Guard().StartDwell(craneID)
+		a.AdvanceClock(a.Config().Limits.DwellWindowTicks)
+		_, _ = machine.Fire(ctx, craneID, model.EventDwellEnd)
+	}
+	snap := a.Snapshot()
+	if len(snap.Cranes) == 0 {
+		return fmt.Errorf("empty snapshot")
+	}
+	return nil
 }
 
-func (s *Service) WindRecoverable(err error) bool { return wind.IsRecoverable(err) }
-func (s *Service) MomentExceeded(err error) bool  { return load.IsMoment(err) }
-func (s *Service) StaleLoad(err error) bool     { return load.IsStale(err) }
-func (s *Service) WindHoldClosed(rigID string) bool { return s.WindWindow.Closed(rigID) }
-func (s *Service) ProcessTick() int64             { return s.Clock.Tick() }
-func (s *Service) AdvanceClock(n int64) int64     { return s.Clock.Advance(n) }
-func (s *Service) RootContext() context.Context   { return s.rootCtx }
+func LoadConfig() (config.Config, error) { return config.LoadFromEnv() }
 
-func (s *Service) CycleOnce(samples map[string]model.LoadSample, winds map[string]model.WindSample) {
-	for _, sample := range samples {
-		s.IngestLoad(sample)
+func NewDefault() (*App, error) { return New(config.Default()) }
+
+func (a *App) PlacePallet(loc model.Location, pallet model.PalletID) error {
+	if err := a.Occupancy().Place(loc, pallet); err != nil {
+		return err
 	}
-	for _, w := range winds {
-		_ = s.IngestWind(w)
+	a.Rig().RefreshCells()
+	return nil
+}
+
+func (a *App) RetrievePallet(ctx context.Context, craneID model.CraneID, pallet model.PalletID, dest model.Location) error {
+	source, ok := a.Occupancy().FindPallet(pallet)
+	if !ok {
+		return model.ErrTaskNotFound
 	}
-	s.TickOnce()
+	svc, ok := a.Coordinator().Get(craneID)
+	if !ok {
+		return model.ErrCraneNotFound
+	}
+	current := svc.Pose().Location
+	if err := a.MoveCrane(ctx, craneID, current, source); err != nil {
+		return err
+	}
+	if err := svc.LoadPallet(pallet); err != nil {
+		return err
+	}
+	if err := a.Occupancy().Remove(source); err != nil {
+		return err
+	}
+	if err := a.MoveCrane(ctx, craneID, source, dest); err != nil {
+		return err
+	}
+	if _, err := svc.UnloadPallet(); err != nil {
+		return err
+	}
+	return a.Occupancy().Place(dest, pallet)
 }

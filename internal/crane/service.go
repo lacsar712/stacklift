@@ -1,225 +1,259 @@
-// Package crane manages tower crane rig services.
 package crane
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
-	"time"
 
-	"github.com/lacsar712/stacklift/internal/boom"
-	"github.com/lacsar712/stacklift/internal/fsm"
-	"github.com/lacsar712/stacklift/internal/hook"
-	"github.com/lacsar712/stacklift/internal/load"
+	"github.com/lacsar712/stacklift/internal/clock"
+	"github.com/lacsar712/stacklift/internal/fork"
 	"github.com/lacsar712/stacklift/internal/model"
-	"github.com/lacsar712/stacklift/internal/slew"
-	"github.com/lacsar712/stacklift/internal/store"
-	"github.com/lacsar712/stacklift/internal/wind"
 )
 
-type Status struct {
-	RigID, Mode     string
-	Azimuth, RadiusM, MomentPct, WindMS float64
-	Revision          uint64
-	duty              model.DutyMode
-}
-
-type Rig struct {
-	ID      string
-	Emitter *slew.Emitter
-	Boom    *boom.Driver
-	FSM     *fsm.DutyMachine
-	Hook    *hook.Sensor
-	Anemo   *wind.Anemometer
-	Store   *store.RigStore
-}
-
-type Group struct {
-	mu    sync.Mutex
-	rigs  map[string]*Rig
-	order []string
-}
-
-func NewGroup() *Group { return &Group{rigs: make(map[string]*Rig)} }
-
-func (g *Group) Register(rig *Rig) {
-	g.mu.Lock()
-	g.rigs[rig.ID] = rig
-	g.order = append(g.order, rig.ID)
-	g.mu.Unlock()
-}
-
-func (g *Group) Get(id string) (*Rig, bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	r, ok := g.rigs[id]
-	return r, ok
-}
-
-func (g *Group) IDs() []string {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	out := make([]string, len(g.order))
-	copy(out, g.order)
-	return out
-}
-
-func (g *Group) StatusAll() []Status {
-	g.mu.Lock()
-	ids := append([]string(nil), g.order...)
-	g.mu.Unlock()
-	out := make([]Status, 0, len(ids))
-	for _, id := range ids {
-		rig, ok := g.Get(id)
-		if !ok {
-			continue
-		}
-		st := Status{RigID: id, Azimuth: rig.Emitter.AngleOf(id)}
-		mode, rev, _ := rig.FSM.Snapshot(id)
-		st.duty = mode
-		st.Mode = string(mode)
-		st.Revision = rev
-		if pose, ok := rig.Boom.PoseOf(id); ok {
-			st.RadiusM = pose.RadiusM
-		}
-		if p, ok := rig.Hook.Last(id); ok {
-			st.MomentPct = p.MomentPct
-		}
-		if w, ok := rig.Anemo.Last(id); ok {
-			st.WindMS = w.SpeedMS
-		}
-		out = append(out, st)
-	}
-	return out
-}
-
 type Service struct {
-	group       *Group
-	coordinator *slew.Coordinator
-	loadSensor  *load.Sensor
-	fsm         *fsm.DutyMachine
-	store       *store.RigStore
-	activeCtx   context.Context
-	cancel      context.CancelFunc
-	mu          sync.Mutex
+	mu          sync.RWMutex
+	craneID     model.CraneID
+	status      model.CraneStatus
+	limits      model.LimitSet
+	forkHandler *fork.LoadHandler
+	clk         *clock.DualClock
+	hoistLocked bool
+	cancelFn    context.CancelFunc
 }
 
-func NewService(group *Group, coord *slew.Coordinator, sensor *load.Sensor, machine *fsm.DutyMachine, store *store.RigStore) *Service {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Service{group: group, coordinator: coord, loadSensor: sensor, fsm: machine, store: store, activeCtx: ctx, cancel: cancel}
-}
-
-func (s *Service) RequestSlew(ctx context.Context, rigID string, targetAz, targetRadius float64, reason string) error {
-	parent := s.activeCtx
-	if ctx != nil {
-		parent = ctx
+func NewService(id model.CraneID, limits model.LimitSet, clk *clock.DualClock) *Service {
+	return &Service{
+		craneID: id, status: model.EmptyCraneStatus(id), limits: limits,
+		forkHandler: fork.NewLoadHandler(id, limits.MaxForkMM), clk: clk,
 	}
-	if err := parent.Err(); err != nil {
+}
+
+func (s *Service) ID() model.CraneID { return s.craneID }
+
+func (s *Service) Status() model.CraneStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.status.Clone()
+}
+
+func (s *Service) SetPose(pose model.CranePose) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pose.CraneID = s.craneID
+	s.status.Pose = pose.Clone()
+	s.status.Revision++
+}
+
+func (s *Service) SetPhase(phase model.CranePhase) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.Phase = phase
+	s.status.Revision++
+	s.status.UpdatedAt = s.clk.WallNow()
+}
+
+func (s *Service) Pose() model.CranePose {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.status.Pose.Clone()
+}
+
+func (s *Service) ForkHandler() *fork.LoadHandler { return s.forkHandler }
+
+func (s *Service) HoistLocked() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.hoistLocked
+}
+
+func (s *Service) lockHoist() {
+	s.mu.Lock()
+	s.hoistLocked = true
+	s.mu.Unlock()
+}
+
+func (s *Service) unlockHoist() {
+	s.mu.Lock()
+	s.hoistLocked = false
+	s.mu.Unlock()
+}
+
+func (s *Service) MoveAxis(ctx context.Context, axis model.MotionAxis, targetMM int64) error {
+	if err := s.checkMotionAllowed(axis); err != nil {
 		return err
 	}
-	req := slew.RunRequest{RigID: rigID, TargetAzDeg: targetAz, TargetRadiusM: targetRadius, Reason: reason, Luff: targetRadius > 0}
-	if err := s.coordinator.Run(parent, req); err != nil {
-		if load.IsMoment(err) {
-			return load.Wrap(rigID, load.ErrMomentExceeded)
+	motionCtx, cancel := context.WithCancel(ctx)
+	s.mu.Lock()
+	if s.cancelFn != nil {
+		s.cancelFn()
+	}
+	s.cancelFn = cancel
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.cancelFn = nil
+		s.mu.Unlock()
+	}()
+	if axis == model.AxisHoist {
+		s.lockHoist()
+		defer s.unlockHoist()
+	}
+	select {
+	case <-motionCtx.Done():
+		return fmt.Errorf("move %s: %w", axis, model.ErrContextDone)
+	default:
+	}
+	return s.executeMotion(motionCtx, axis, targetMM)
+}
+
+func (s *Service) checkMotionAllowed(axis model.MotionAxis) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.status.EStopActive {
+		return model.ErrEStopActive
+	}
+	if s.status.Interlocked {
+		return model.NewInterlockError("service", s.craneID, "crane interlocked")
+	}
+	if model.IsMotionPhase(s.status.Phase) {
+		active, ok := model.ActiveAxis(s.status.Phase)
+		if ok && active != axis {
+			return model.NewMotionError(axis, s.craneID, model.ErrAxisConflict)
 		}
-		return err
 	}
-	s.syncPose(rigID)
 	return nil
 }
 
-func (s *Service) EmergencyStop(rigID string, tick int64) error {
+func (s *Service) executeMotion(ctx context.Context, axis model.MotionAxis, targetMM int64) error {
 	s.mu.Lock()
-	s.cancel()
-	s.activeCtx, s.cancel = context.WithCancel(context.Background())
+	s.status.Phase = phaseForAxis(axis)
+	progress := model.MotionProgress{
+		Axis: axis, CurrentMM: s.currentMMLocked(axis), TargetMM: targetMM,
+		StartedTick: s.clk.ProcessTick(),
+	}
+	s.setProgressLocked(axis, progress)
+	s.status.Revision++
 	s.mu.Unlock()
-	_, err := s.fsm.Transition(s.activeCtx, model.TransitionRequest{RigID: rigID, To: model.DutyEmergency, Tick: tick, Force: true})
-	return err
-}
 
-func (s *Service) Transition(ctx context.Context, req model.TransitionRequest) (model.TransitionResult, error) {
-	return s.fsm.Transition(ctx, req)
-}
-
-func (s *Service) IngestLoad(sample model.LoadSample) { s.loadSensor.Put(sample) }
-
-func (s *Service) syncPose(rigID string) {
-	rig, ok := s.group.Get(rigID)
-	if !ok {
-		return
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("execute %s: %w", axis, model.ErrContextDone)
+	default:
 	}
-	pose, _ := rig.Boom.PoseOf(rigID)
-	moment := 0.0
-	if p, ok := rig.Hook.Last(rigID); ok {
-		moment = p.MomentPct
-	}
-	s.store.PutPose(model.RigPose{
-		RigID: rigID, AzimuthDeg: rig.Emitter.AngleOf(rigID), RadiusM: pose.RadiusM,
-		HookHeightM: pose.HookHeightM, BoomAngleDeg: pose.BoomAngleDeg, MomentPct: moment, UpdatedAt: time.Now().UTC(),
-	})
+
+	s.mu.Lock()
+	s.setMMLocked(axis, targetMM)
+	progress.Complete = true
+	progress.CurrentMM = targetMM
+	s.setProgressLocked(axis, progress)
+	s.status.Phase = model.PhaseIdle
+	s.status.Pose.ProcessTick = s.clk.ProcessTick()
+	s.status.UpdatedAt = s.clk.WallNow()
+	s.status.Revision++
+	s.mu.Unlock()
+	return nil
 }
 
-func (s *Service) ActiveContext() context.Context {
+func phaseForAxis(axis model.MotionAxis) model.CranePhase {
+	switch axis {
+	case model.AxisTravel:
+		return model.PhaseTraveling
+	case model.AxisHoist:
+		return model.PhaseHoisting
+	case model.AxisFork:
+		return model.PhaseForking
+	default:
+		return model.PhaseIdle
+	}
+}
+
+func (s *Service) currentMMLocked(axis model.MotionAxis) int64 {
+	switch axis {
+	case model.AxisTravel:
+		return s.status.Pose.TravelMM
+	case model.AxisHoist:
+		return s.status.Pose.HoistMM
+	case model.AxisFork:
+		return s.status.Pose.ForkMM
+	default:
+		return 0
+	}
+}
+
+func (s *Service) setMMLocked(axis model.MotionAxis, mm int64) {
+	switch axis {
+	case model.AxisTravel:
+		s.status.Pose.TravelMM = mm
+	case model.AxisHoist:
+		s.status.Pose.HoistMM = mm
+	case model.AxisFork:
+		s.status.Pose.ForkMM = mm
+	}
+}
+
+func (s *Service) setProgressLocked(axis model.MotionAxis, p model.MotionProgress) {
+	switch axis {
+	case model.AxisTravel:
+		s.status.Travel = p
+	case model.AxisHoist:
+		s.status.Hoist = p
+	case model.AxisFork:
+		s.status.Fork = p
+	}
+}
+
+func (s *Service) CancelMotion() {
+	s.mu.Lock()
+	fn := s.cancelFn
+	s.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+func (s *Service) SetEStop(active bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.activeCtx
-}
-
-func (s *Service) Bootstrap() {
-	for _, id := range s.group.IDs() {
-		rig, ok := s.group.Get(id)
-		if !ok {
-			continue
-		}
-		rig.Emitter.SetAngle(id, 0)
-		rig.Boom.Ensure(id)
-		rig.FSM.Ensure(id)
-		s.syncPose(id)
+	s.status.EStopActive = active
+	if active {
+		s.status.Phase = model.PhaseEmergency
 	}
+	s.status.Revision++
 }
 
-type Builder struct {
-	towerH, ratedKg, rateDeg float64
-	limits                   model.LimitSet
-	windHold                 int64
+func (s *Service) SetInterlocked(locked bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.Interlocked = locked
+	s.status.Revision++
 }
 
-func NewBuilder(towerH, ratedKg, rateDeg float64, limits model.LimitSet, windHold int64) *Builder {
-	return &Builder{towerH, ratedKg, rateDeg, limits, windHold}
-}
-
-func (b *Builder) Build(id string, emitter *slew.Emitter, machine *fsm.DutyMachine, st *store.RigStore) *Rig {
-	geom := boom.NewGeometry(b.limits.MinRadiusM, b.limits.MaxRadiusM, b.limits.MinBoomAngleDeg, b.limits.MaxBoomAngleDeg)
-	driver := boom.NewDriver(geom, b.towerH, b.rateDeg)
-	anemo := wind.NewAnemometer(b.limits.MaxWindMS, b.limits.GustFactor, b.windHold)
-	hookSensor := hook.NewSensor(b.ratedKg)
-	rig := &Rig{ID: id, Emitter: emitter, Boom: driver, FSM: machine, Hook: hookSensor, Anemo: anemo, Store: st}
-	emitter.SetAngle(id, 0)
-	driver.Ensure(id)
-	machine.Ensure(id)
-	return rig
-}
-
-type SiteSummary struct {
-	RigCount               int
-	Emergency, WindHold    bool
-	MaxMoment, MaxWindMS   float64
-}
-
-func Summarize(group *Group) SiteSummary {
-	s := SiteSummary{RigCount: len(group.IDs())}
-	for _, st := range group.StatusAll() {
-		if st.duty == model.DutyEmergency {
-			s.Emergency = true
-		}
-		if st.duty == model.DutyWindHold {
-			s.WindHold = true
-		}
-		if st.MomentPct > s.MaxMoment {
-			s.MaxMoment = st.MomentPct
-		}
-		if st.WindMS > s.MaxWindMS {
-			s.MaxWindMS = st.WindMS
-		}
+func (s *Service) LoadPallet(pallet model.PalletID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.status.Pose.Loaded {
+		return fmt.Errorf("already loaded: %w", model.ErrMotionInProgress)
 	}
-	return s
+	s.status.Pose.Loaded = true
+	s.status.Pose.PalletID = pallet
+	s.status.Revision++
+	return nil
+}
+
+func (s *Service) UnloadPallet() (model.PalletID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.status.Pose.Loaded {
+		return "", fmt.Errorf("not loaded: %w", model.ErrCellEmpty)
+	}
+	id := s.status.Pose.PalletID
+	s.status.Pose.Loaded = false
+	s.status.Pose.PalletID = ""
+	s.status.Revision++
+	return id, nil
+}
+
+func (s *Service) IsContextError(err error) bool {
+	return errors.Is(err, model.ErrContextDone)
 }

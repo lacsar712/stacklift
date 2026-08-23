@@ -2,55 +2,55 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/lacsar712/stacklift/internal/app"
-	"github.com/lacsar712/stacklift/internal/config"
-	"github.com/lacsar712/stacklift/internal/web"
 )
 
 func main() {
-	cfg := config.Default()
-	if path := os.Getenv("CRANESAFE_CONFIG"); path != "" {
-		loaded, err := config.LoadFile(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "config: %v\n", err)
-			os.Exit(1)
-		}
-		cfg = loaded
-	}
-	svc, err := app.New(cfg)
+	demo := flag.Bool("demo", false, "run demo retrieval cycle")
+	flag.Parse()
+
+	cfg, err := app.LoadConfig()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "app: %v\n", err)
+		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
 		os.Exit(1)
 	}
-	mux := http.NewServeMux()
-	mux.Handle("/api/", svc.Server.Handler())
-	mux.Handle("/", web.Handler())
-	httpSrv := &http.Server{Addr: cfg.ListenAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	errCh := make(chan error, 1)
-	go func() {
-		fmt.Printf("stacklift listening on %s\n", cfg.ListenAddr)
-		errCh <- httpSrv.ListenAndServe()
-	}()
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	select {
-	case sig := <-sigCh:
-		fmt.Printf("shutdown: %s\n", sig)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = httpSrv.Shutdown(ctx)
-		svc.Cancel()
-	case err := <-errCh:
-		if err != nil && err != http.ErrServerClosed {
-			fmt.Fprintf(os.Stderr, "http: %v\n", err)
+	if *demo {
+		cfg.DemoMode = true
+	}
+
+	application, err := app.New(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "init error: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	if err := application.Start(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "start error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("stacklift ASRS controller started (%d cranes)\n", application.CraneCount())
+
+	if cfg.DemoMode {
+		if err := app.RunDemo(ctx, application); err != nil {
+			fmt.Fprintf(os.Stderr, "demo error: %v\n", err)
 			os.Exit(1)
 		}
+		fmt.Println("demo cycle complete")
+		application.Shutdown(ctx)
+		return
 	}
+
+	<-ctx.Done()
+	fmt.Println("shutting down")
+	application.Shutdown(ctx)
 }

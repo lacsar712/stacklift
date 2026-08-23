@@ -4,51 +4,87 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/lacsar712/stacklift/internal/app"
-	"github.com/lacsar712/stacklift/internal/config"
-	"github.com/lacsar712/stacklift/internal/load"
 	"github.com/lacsar712/stacklift/internal/model"
 )
 
-func TestNew(t *testing.T) {
-	svc, err := app.New(config.Default())
-	if err != nil {
+func TestNewDefault(t *testing.T) {
+	a, err := app.NewDefault()
+	if err != nil || a == nil {
+		t.Fatalf("new default: %v", err)
+	}
+}
+
+func TestStart(t *testing.T) {
+	a, _ := app.NewDefault()
+	if err := a.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if svc.ProcessTick() != 0 {
-		t.Fatal("tick")
+	if !a.Started() || a.CraneCount() != 4 {
+		t.Fatalf("started=%v cranes=%d", a.Started(), a.CraneCount())
 	}
 }
 
-func TestSlew(t *testing.T) {
-	svc, _ := app.New(config.Default())
-	svc.IngestLoad(model.LoadSample{RigID: "TC-01", MomentPct: 50, At: time.Now()})
-	if err := svc.RequestSlew(context.Background(), "TC-01", 20, 0, "t"); err != nil {
+func TestSnapshot(t *testing.T) {
+	a, _ := app.NewDefault()
+	_ = a.Start(context.Background())
+	if len(a.Snapshot().Cranes) == 0 {
+		t.Fatal("empty snapshot")
+	}
+}
+
+func TestMoveCrane(t *testing.T) {
+	a, _ := app.NewDefault()
+	_ = a.Start(context.Background())
+	from := model.Location{Aisle: "01", Bay: 1, Level: 1, Depth: 0}
+	to := model.Location{Aisle: "01", Bay: 2, Level: 1, Depth: 0}
+	if err := a.MoveCrane(context.Background(), "CR-01", from, to); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestSentinels(t *testing.T) {
-	svc, _ := app.New(config.Default())
-	if !svc.MomentExceeded(load.Wrap("TC-01", load.ErrMomentExceeded)) {
-		t.Fatal("moment")
-	}
-	if !svc.StaleLoad(load.Wrap("TC-01", load.ErrStaleLoad)) {
-		t.Fatal("stale")
-	}
-}
-
-func TestEmergency(t *testing.T) {
-	svc, _ := app.New(config.Default())
-	if err := svc.EmergencyStop("TC-01"); err != nil {
+func TestRunDemo(t *testing.T) {
+	a, _ := app.NewDefault()
+	if err := app.RunDemo(context.Background(), a); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestMomentChain(t *testing.T) {
-	if !errors.Is(load.Wrap("TC-01", load.ErrMomentExceeded), load.ErrMomentExceeded) {
-		t.Fatal("chain")
+func TestPlacePallet(t *testing.T) {
+	a, _ := app.NewDefault()
+	_ = a.Start(context.Background())
+	loc := model.Location{Aisle: "01", Bay: 1, Level: 1, Depth: 0}
+	if err := a.PlacePallet(loc, "PLT-1"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRetrievePallet(t *testing.T) {
+	a, _ := app.NewDefault()
+	ctx := context.Background()
+	_ = a.Start(ctx)
+	source := model.Location{Aisle: "01", Bay: 2, Level: 1, Depth: 0}
+	dest := model.Location{Aisle: "01", Bay: 4, Level: 2, Depth: 0}
+	_ = a.PlacePallet(source, "PLT-RET")
+	if err := a.RetrievePallet(ctx, "CR-01", "PLT-RET", dest); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAdvanceClock(t *testing.T) {
+	a, _ := app.NewDefault()
+	if a.AdvanceClock(10) != 10 {
+		t.Fatal("expected tick 10")
+	}
+}
+
+func TestMoveCraneNotFound(t *testing.T) {
+	a, _ := app.NewDefault()
+	_ = a.Start(context.Background())
+	from := model.Location{Aisle: "01", Bay: 1, Level: 1, Depth: 0}
+	to := model.Location{Aisle: "01", Bay: 2, Level: 1, Depth: 0}
+	if !errors.Is(a.MoveCrane(context.Background(), "CR-99", from, to), model.ErrCraneNotFound) {
+		t.Fatal("expected not found")
 	}
 }

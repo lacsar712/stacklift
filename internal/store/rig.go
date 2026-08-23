@@ -1,89 +1,55 @@
 package store
 
 import (
-	"fmt"
 	"sync"
-	"time"
 
+	"github.com/lacsar712/stacklift/internal/aisle"
+	"github.com/lacsar712/stacklift/internal/crane"
+	"github.com/lacsar712/stacklift/internal/clock"
 	"github.com/lacsar712/stacklift/internal/model"
+	"github.com/lacsar712/stacklift/internal/safety"
 )
 
-type RigStore struct {
-	mu     sync.RWMutex
-	poses  map[string]model.RigPose
-	status map[string]model.RigStatus
-	rev    uint64
+type Rig struct {
+	mu        sync.RWMutex
+	coord     *crane.Coordinator
+	occupancy *aisle.Occupancy
+	monitor   *safety.Monitor
+	snapshots *SnapshotStore
+	clk       *clock.DualClock
 }
 
-func NewRigStore() *RigStore {
-	return &RigStore{poses: make(map[string]model.RigPose), status: make(map[string]model.RigStatus)}
+func NewRig(coord *crane.Coordinator, occ *aisle.Occupancy, monitor *safety.Monitor, clk *clock.DualClock) *Rig {
+	return &Rig{coord: coord, occupancy: occ, monitor: monitor, snapshots: NewSnapshotStore(), clk: clk}
 }
 
-func (s *RigStore) PutPose(pose model.RigPose) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.rev++
-	s.poses[pose.RigID] = pose.Clone()
+func (r *Rig) Capture() model.WarehouseSnapshot {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	snap := model.NewWarehouseSnapshot(r.snapshots.Revision()+1, r.clk.ProcessTick())
+	snap.Cranes = r.coord.SnapshotAll()
+	snap.Cells = r.occupancy.Snapshot()
+	snap.Alarms = r.monitor.Alarms()
+	r.snapshots.Save(snap)
+	return snap.Clone()
 }
 
-func (s *RigStore) GetPose(rigID string) (model.RigPose, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	p, ok := s.poses[rigID]
+func (r *Rig) SnapshotStore() *SnapshotStore { return r.snapshots }
+func (r *Rig) Latest() model.WarehouseSnapshot { return r.snapshots.Load() }
+
+func (r *Rig) RefreshCrane(id model.CraneID) {
+	svc, ok := r.coord.Get(id)
 	if !ok {
-		return model.RigPose{}, false
+		return
 	}
-	return p.Clone(), true
+	r.snapshots.UpdateCrane(id, svc.Status())
 }
 
-func (s *RigStore) Snapshot() []model.RigPose {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]model.RigPose, 0, len(s.poses))
-	for _, p := range s.poses {
-		out = append(out, p.Clone())
-	}
-	return out
-}
+func (r *Rig) RefreshCells() { r.snapshots.UpdateCells(r.occupancy.Snapshot()) }
 
-func (s *RigStore) PutStatus(st model.RigStatus) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.rev++
-	cp := st.Clone()
-	cp.Revision = s.rev
-	s.status[st.RigID] = cp
-}
-
-func (s *RigStore) StatusSnapshot() []model.RigStatus {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]model.RigStatus, 0, len(s.status))
-	for _, st := range s.status {
-		out = append(out, st.Clone())
-	}
-	return out
-}
-
-func (s *RigStore) UpdatePose(rigID string, fn func(*model.RigPose) error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	p, ok := s.poses[rigID]
-	if !ok {
-		return fmt.Errorf("store: unknown rig %s", rigID)
-	}
-	cp := p.Clone()
-	if err := fn(&cp); err != nil {
-		return err
-	}
-	s.rev++
-	cp.UpdatedAt = time.Now().UTC()
-	s.poses[rigID] = cp
-	return nil
-}
-
-func (s *RigStore) Revision() uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.rev
-}
+func (r *Rig) Coordinator() *crane.Coordinator { return r.coord }
+func (r *Rig) Occupancy() *aisle.Occupancy     { return r.occupancy }
+func (r *Rig) Monitor() *safety.Monitor        { return r.monitor }
+func (r *Rig) Clock() *clock.DualClock         { return r.clk }
+func (r *Rig) CraneCount() int                 { return r.coord.Count() }
+func (r *Rig) OccupiedCells() int              { return r.occupancy.CountOccupied() }
