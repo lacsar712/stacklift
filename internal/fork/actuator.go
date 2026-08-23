@@ -125,9 +125,11 @@ func (t *Telescope) CheckLoadBalance(maxDeltaMM int64) error {
 	_, leftMM := t.left.Snapshot()
 	_, rightMM := t.right.Snapshot()
 	delta := leftMM - rightMM
-	if delta < 0 { delta = -delta }
+	if delta < 0 {
+		delta = -delta
+	}
 	if delta > maxDeltaMM {
-		return fmt.Errorf("fork timeout: %w", context.DeadlineExceeded)
+		return fmt.Errorf("fork load imbalance left %d right %d delta %dmm exceeds %dmm: %w", leftMM, rightMM, delta, maxDeltaMM, model.ErrForkLoadImbalance)
 	}
 	return nil
 }
