@@ -224,12 +224,24 @@ func (s *Service) CancelMotion() {
 
 func (s *Service) SetEStop(active bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.status.EStopActive = active
 	if active {
 		s.status.Phase = model.PhaseEmergency
 	}
 	s.status.Revision++
+	fn := s.cancelFn
+	if active && fn != nil {
+		s.cancelFn = nil
+	}
+	s.mu.Unlock()
+	if active && fn != nil {
+		// Propagate the aisle estop button into the motion execution layer:
+		// cancel any in-flight axis motion so the executor stops emitting
+		// velocity commands from cached route segments instead of waiting
+		// for the move to drain on its own. Mirrors the FSM estop path,
+		// which calls CancelMotion() alongside SetEStop(true).
+		fn()
+	}
 }
 
 func (s *Service) SetInterlocked(locked bool) {
