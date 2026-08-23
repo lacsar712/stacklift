@@ -1,0 +1,5 @@
+body { font-family: system-ui, sans-serif; background: #0f1419; color: #e8edf4; margin: 0; }
+header { padding: 1rem 2rem; background: #1a2332; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1rem; padding: 1rem 2rem; }
+.rig-card { background: #1a2332; border: 1px solid #2a3544; border-radius: 8px; padding: 1rem; }
+button { margin: 1rem 2rem; padding: 0.5rem 1rem; }
