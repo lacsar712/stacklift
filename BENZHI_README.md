@@ -1,6 +1,6 @@
-# HookRelay
+# stacklift
 
-Signed ingress + reliable outbound webhook delivery (retry, circuit breaker, rate limit, DLQ, replay).
+stacklift 是一套塔式起重机力矩百分比限位工业过程控制系统，用于回转臂架联锁与风速监护。
 
 ## Requirements
 
